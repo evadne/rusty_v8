@@ -1015,11 +1015,18 @@ fn print_prebuilt_src_binding_path() {
   let features = prebuilt_features_suffix();
   let name = format!("src_binding{features}_{profile}_{target}.rs");
 
-  let src_binding_path = get_dirs().root.join("gen").join(name.clone());
-
-  if let Ok(base) = env::var("RUSTY_V8_MIRROR") {
+  let mut src_binding_path = get_dirs().root.join("gen").join(&name);
+  let mirror = env::var("RUSTY_V8_MIRROR").ok();
+  if mirror.is_some() || !src_binding_path.exists() {
+    let base = mirror.unwrap_or_else(|| {
+      "https://github.com/denoland/rusty_v8/releases/download".into()
+    });
     let version = env::var("CARGO_PKG_VERSION").unwrap();
     let url = format!("{base}/v{version}/{name}");
+    // Git checkouts do not contain every release binding. Keep downloaded
+    // build products out of the source checkout, as with the static library.
+    src_binding_path =
+      PathBuf::from(env::var_os("OUT_DIR").unwrap()).join(name);
     download_file(&url, &src_binding_path);
   }
 
