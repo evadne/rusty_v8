@@ -1,5 +1,6 @@
 use std::borrow::Borrow;
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -8,6 +9,7 @@ use std::mem::forget;
 use std::mem::transmute;
 use std::ops::Deref;
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 use crate::Data;
 use crate::Isolate;
@@ -661,6 +663,77 @@ impl HandleHost {
   }
 }
 
+// Shared only on the isolate thread. Unlike IsolateHandle, this state remains
+// usable after public cross-thread access has been invalidated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WeakTeardownPhase {
+  Live,
+  Disposing,
+  Disposed,
+}
+
+#[derive(Debug)]
+pub(crate) struct WeakTeardownState {
+  phase: Cell<WeakTeardownPhase>,
+  deferred: RefCell<Vec<DeferredWeakData>>,
+  cancelled_finalizers: RefCell<std::collections::HashSet<FinalizerId>>,
+}
+
+#[derive(Debug)]
+struct DeferredWeakData {
+  pointer: *mut c_void,
+  reclaim: unsafe fn(*mut c_void),
+}
+
+impl Drop for DeferredWeakData {
+  fn drop(&mut self) {
+    // SAFETY: The queue receives each Box once, and is emptied only after
+    // native disposal, when no callback can reference its allocation.
+    unsafe { (self.reclaim)(self.pointer) };
+  }
+}
+
+impl WeakTeardownState {
+  pub(crate) fn new() -> Self {
+    Self {
+      phase: Cell::new(WeakTeardownPhase::Live),
+      deferred: RefCell::new(Vec::new()),
+      cancelled_finalizers: RefCell::new(Default::default()),
+    }
+  }
+
+  pub(crate) fn begin(&self) {
+    assert_eq!(
+      self.phase.replace(WeakTeardownPhase::Disposing),
+      WeakTeardownPhase::Live
+    );
+  }
+
+  pub(crate) fn finish(&self) {
+    assert_eq!(
+      self.phase.replace(WeakTeardownPhase::Disposed),
+      WeakTeardownPhase::Disposing
+    );
+    // Do not retain a RefCell borrow across destruction.
+    let deferred = std::mem::take(&mut *self.deferred.borrow_mut());
+    drop(deferred);
+  }
+
+  pub(crate) fn is_cancelled(&self, id: FinalizerId) -> bool {
+    self.cancelled_finalizers.borrow().contains(&id)
+  }
+
+  fn defer<T>(&self, data: Box<T>) {
+    unsafe fn reclaim<T>(pointer: *mut c_void) {
+      unsafe { drop(Box::from_raw(pointer.cast::<T>())) };
+    }
+    self.deferred.borrow_mut().push(DeferredWeakData {
+      pointer: Box::into_raw(data).cast(),
+      reclaim: reclaim::<T>,
+    });
+  }
+}
+
 /// An object reference that does not prevent garbage collection for the object,
 /// and which allows installing finalization callbacks which will be called
 /// after the object has been GC'd.
@@ -678,6 +751,7 @@ impl HandleHost {
 pub struct Weak<T> {
   data: Option<Box<WeakData<T>>>,
   isolate_handle: IsolateHandle,
+  teardown: Rc<WeakTeardownState>,
 }
 
 impl<T> Weak<T> {
@@ -746,6 +820,7 @@ impl<T> Weak<T> {
       pointer: Default::default(),
       finalizer_id,
       weak_dropped: Cell::new(false),
+      teardown_owned: Cell::new(false),
     });
     let data = data.cast().as_ptr();
     let data = unsafe {
@@ -762,6 +837,7 @@ impl<T> Weak<T> {
     Self {
       data: Some(weak_data),
       isolate_handle: unsafe { (*isolate).thread_safe_handle() },
+      teardown: unsafe { (*isolate).weak_teardown_state() },
     }
   }
 
@@ -771,6 +847,7 @@ impl<T> Weak<T> {
     Weak {
       data: None,
       isolate_handle: isolate.thread_safe_handle(),
+      teardown: isolate.weak_teardown_state(),
     }
   }
 
@@ -814,6 +891,7 @@ impl<T> Weak<T> {
       Weak {
         data: None,
         isolate_handle: self.isolate_handle.clone(),
+        teardown: self.teardown.clone(),
       }
     }
   }
@@ -832,6 +910,7 @@ impl<T> Weak<T> {
     Weak {
       data: data.map(|raw| unsafe { Box::from_raw(raw.cast().as_ptr()) }),
       isolate_handle: isolate.thread_safe_handle(),
+      teardown: isolate.weak_teardown_state(),
     }
   }
 
@@ -965,10 +1044,15 @@ impl<T> Weak<T> {
     let mut isolate = unsafe { Isolate::from_raw_ptr(isolate) };
     let finalizer: Option<FinalizerCallback> = {
       let finalizer_id = weak_data.finalizer_id.unwrap();
-      isolate.get_finalizer_map_mut().map.remove(&finalizer_id)
+      let finalizer = isolate.get_finalizer_map_mut().map.remove(&finalizer_id);
+      if weak_data.weak_dropped.get() {
+        None
+      } else {
+        finalizer
+      }
     };
 
-    if weak_data.weak_dropped.get() {
+    if weak_data.weak_dropped.get() && !weak_data.teardown_owned.get() {
       // SAFETY: If weak_dropped is true, the corresponding Weak has been dropped,
       // so it's safe to take ownership of the Box<WeakData<T>> and drop it.
       let _ = unsafe {
@@ -1013,6 +1097,19 @@ impl<T> Drop for Weak<T> {
       unsafe { v8__Global__Reset(data.cast().as_ptr()) };
       remove_finalizer(self.data.as_ref().unwrap().finalizer_id);
     } else if let Some(weak_data) = self.data.take() {
+      if self.teardown.phase.get() != WeakTeardownPhase::Live {
+        if let Some(id) = weak_data.finalizer_id {
+          self.teardown.cancelled_finalizers.borrow_mut().insert(id);
+        }
+      }
+      if self.teardown.phase.get() == WeakTeardownPhase::Disposing {
+        // Native teardown can still invoke callbacks. The queue owns this
+        // allocation until V8 disposal completes, whether or not GC runs.
+        weak_data.weak_dropped.set(true);
+        weak_data.teardown_owned.set(true);
+        self.teardown.defer(weak_data);
+        return;
+      }
       // The second pass callback removes the finalizer, so if there is one,
       // the second pass hasn't yet run, and WeakData will have to be alive.
       // In that case we leak the WeakData but remove the finalizer.
@@ -1076,6 +1173,7 @@ pub struct WeakData<T> {
   pointer: Cell<Option<NonNull<T>>>,
   finalizer_id: Option<FinalizerId>,
   weak_dropped: Cell<bool>,
+  teardown_owned: Cell<bool>,
 }
 
 impl<T> std::fmt::Debug for WeakData<T> {
@@ -1111,10 +1209,18 @@ impl FinalizerMap {
     id
   }
 
+  pub(crate) fn take(&mut self) -> Self {
+    let taken = std::mem::take(self);
+    // Re-entrant finalisers can register new callbacks during a drain.
+    // Preserve IDs so teardown cancellation never targets a different weak.
+    self.next_id = taken.next_id;
+    taken
+  }
+
   pub(crate) fn drain(
     &mut self,
-  ) -> impl Iterator<Item = FinalizerCallback> + '_ {
-    self.map.drain().map(|(_, finalizer)| finalizer)
+  ) -> impl Iterator<Item = (FinalizerId, FinalizerCallback)> + '_ {
+    self.map.drain()
   }
 }
 
@@ -1248,3 +1354,30 @@ impl<T> Drop for Eternal<T> {
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct SealedLocal<T>(pub(crate) NonNull<T>);
+
+#[cfg(test)]
+mod weak_teardown_tests {
+  use super::*;
+
+  #[test]
+  fn deferred_allocations_are_reclaimed_without_gc() {
+    struct Probe(Rc<Cell<usize>>);
+    impl Drop for Probe {
+      fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+      }
+    }
+    let drops = Rc::new(Cell::new(0));
+    let state = WeakTeardownState::new();
+    state.begin();
+    for _ in 0..100 {
+      state.defer(Box::new(Probe(drops.clone())));
+    }
+    assert_eq!(drops.get(), 0);
+    state.finish();
+    assert_eq!(drops.get(), 100);
+    assert!(state.deferred.borrow().is_empty());
+    drop(state);
+    assert_eq!(drops.get(), 100);
+  }
+}

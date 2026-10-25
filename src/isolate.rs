@@ -30,6 +30,7 @@ use crate::gc::GCCallbackFlags;
 use crate::gc::GCType;
 use crate::handle::FinalizerCallback;
 use crate::handle::FinalizerMap;
+use crate::handle::WeakTeardownState;
 use crate::isolate_create_params::CreateParams;
 use crate::isolate_create_params::raw;
 use crate::promise::PromiseRejectMessage;
@@ -46,6 +47,7 @@ use crate::wasm::WasmStreaming;
 use crate::wasm::trampoline;
 use std::cell::UnsafeCell;
 use std::ffi::CStr;
+use std::rc::Rc;
 
 use std::any::Any;
 use std::any::TypeId;
@@ -979,6 +981,11 @@ impl Isolate {
   }
 
   #[inline(always)]
+  pub(crate) fn weak_teardown_state(&self) -> Rc<WeakTeardownState> {
+    self.get_annex().weak_teardown.clone()
+  }
+
+  #[inline(always)]
   pub fn thread_safe_handle(&self) -> IsolateHandle {
     self.get_annex().isolate_handle.clone()
   }
@@ -1028,8 +1035,7 @@ impl Isolate {
   /// resolve the annex through `get_annex()` / `get_annex_mut()`.
   ///
   /// The returned pointer must be passed exactly once to
-  /// [`Self::finish_annex_dispose`] (or, on the snapshot path, dropped by
-  /// [`Self::dispose_annex`]).
+  /// [`Self::finish_annex_dispose`] after native disposal completes.
   ///
   /// # Safety
   ///
@@ -1056,6 +1062,7 @@ impl Isolate {
     unsafe {
       // Null the `IsolateHandle` so handles outliving the isolate see a
       // disposed state.
+      (*annex_ptr).weak_teardown.begin();
       (*annex_ptr).global_liveness().dispose();
       (*annex_ptr).isolate_handle.dispose();
     }
@@ -1092,8 +1099,11 @@ impl Isolate {
     // borrows a local instead of `(*annex_ptr).finalizer_map`. Callbacks
     // re-entering the annex via `get_annex_mut()` would otherwise alias
     // an in-flight `&mut`.
-    let mut map = unsafe { std::mem::take(&mut (*annex_ptr).finalizer_map) };
-    for finalizer in map.drain() {
+    let mut map = unsafe { (*annex_ptr).finalizer_map.take() };
+    for (id, finalizer) in map.drain() {
+      if unsafe { (*annex_ptr).weak_teardown.is_cancelled(id) } {
+        continue;
+      }
       if let FinalizerCallback::Guaranteed(callback) = finalizer {
         callback();
       }
@@ -1113,25 +1123,9 @@ impl Isolate {
   /// [`Self::prepare_annex_for_dispose`] call, and the V8 isolate must
   /// already be fully disposed (so no further callbacks can fire).
   unsafe fn finish_annex_dispose(annex_ptr: *mut IsolateAnnex) {
+    unsafe { (*annex_ptr).weak_teardown.finish() };
     unsafe { Self::run_remaining_guaranteed_finalizers(annex_ptr) };
     unsafe { drop(Box::from_raw(annex_ptr)) };
-  }
-
-  /// Snapshot-path teardown.
-  ///
-  /// Used by [`OwnedIsolate::create_blob`], which consumes the isolate
-  /// before V8 has run its final dispose. Cleans up the annex synchronously
-  /// (no weak-callback re-entry to worry about here) and nulls `ANNEX_SLOT`
-  /// so the snapshot creator's later isolate-dispose sees a clean slot.
-  unsafe fn dispose_annex(&mut self) -> Box<dyn Any> {
-    let (annex_ptr, create_param_allocations) =
-      unsafe { self.prepare_annex_for_dispose() };
-    unsafe { Self::run_remaining_guaranteed_finalizers(annex_ptr) };
-    let taken_annex =
-      self.take_data_internal(Self::ANNEX_SLOT) as *mut IsolateAnnex;
-    debug_assert_eq!(taken_annex, annex_ptr);
-    unsafe { drop(Box::from_raw(annex_ptr)) };
-    create_param_allocations
   }
 
   #[inline(always)]
@@ -1208,14 +1202,6 @@ impl Isolate {
   #[inline(always)]
   pub(crate) fn set_data_internal(&mut self, slot: u32, data: *mut c_void) {
     unsafe { v8__Isolate__SetData(self.as_real_ptr(), slot, data) }
-  }
-
-  /// Get the value of the slot and replace it with a null pointer.
-  #[inline(always)]
-  fn take_data_internal(&mut self, slot: u32) -> *mut c_void {
-    let ptr = self.get_data_internal(slot);
-    self.set_data_internal(slot, null_mut());
-    ptr
   }
 
   // pub(crate) fn init_scope_root(&mut self) {
@@ -2058,6 +2044,7 @@ pub(crate) struct IsolateAnnex {
   create_param_allocations: Option<Box<dyn Any>>,
   slots: HashMap<TypeId, RawSlot, BuildTypeIdHasher>,
   finalizer_map: FinalizerMap,
+  weak_teardown: Rc<WeakTeardownState>,
   maybe_snapshot_creator: Option<SnapshotCreator>,
   isolate_handle: IsolateHandle,
   global_liveness: NonNull<IsolateLiveness>,
@@ -2073,6 +2060,7 @@ impl IsolateAnnex {
       create_param_allocations: Some(create_param_allocations),
       slots: HashMap::default(),
       finalizer_map: FinalizerMap::default(),
+      weak_teardown: Rc::new(WeakTeardownState::new()),
       maybe_snapshot_creator: None,
       isolate_handle: IsolateHandle::new(isolate),
       global_liveness: NonNull::from(global_liveness),
@@ -2391,15 +2379,19 @@ impl OwnedIsolate {
 
     // create_param_allocations is needed during CreateBlob
     // so v8 can read external references
-    let _create_param_allocations = unsafe {
-      // self.dispose_scope_root();
-      self.dispose_annex()
+    let (annex_ptr, _create_param_allocations) = unsafe {
+      let prepared = self.prepare_annex_for_dispose();
+      Isolate::run_remaining_guaranteed_finalizers(prepared.0);
+      prepared
     };
 
     // The isolate is owned by the snapshot creator; we need to forget it
     // here as the snapshot creator will drop it when running the destructor.
     std::mem::forget(self);
-    snapshot_creator.create_blob(function_code_handling)
+    let blob = snapshot_creator.create_blob(function_code_handling);
+    drop(snapshot_creator);
+    unsafe { Isolate::finish_annex_dispose(annex_ptr) };
+    blob
   }
 }
 
